@@ -1,0 +1,145 @@
+services:
+  # ─── Infrastructure ─────────────────────────────────────
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  project-postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${PROJECT_POSTGRES_USER}
+      POSTGRES_PASSWORD: ${PROJECT_POSTGRES_PASSWORD}
+      POSTGRES_DB: ${PROJECT_POSTGRES_DB}
+    volumes:
+      - projectpgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PROJECT_POSTGRES_USER} -d ${PROJECT_POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  mongo:
+    image: mongo:7
+    volumes:
+      - mongodata:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    # Stable node name + a fixed Erlang cookie. Setting the cookie via env makes
+    # the image entrypoint write it with correct ownership, sidestepping the
+    # ".erlang.cookie: eacces" permission error seen on Docker Desktop / Windows.
+    hostname: rabbitmq
+    environment:
+      RABBITMQ_ERLANG_COOKIE: task-manager-cookie
+    ports:
+      - "5672:5672"    # AMQP
+      - "15672:15672"  # management UI (guest/guest)
+    # check_port_connectivity verifies the AMQP listener is actually accepting
+    # connections (plain ping passes before 5672 is bound).
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_port_connectivity"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 30s
+
+  # ─── Application services ───────────────────────────────
+  auth-service:
+    build: ./services/auth-service
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      AUTH_PORT: ${AUTH_PORT}
+      DATABASE_URL: ${DATABASE_URL}
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_EXPIRES_IN: ${JWT_EXPIRES_IN}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    expose:
+      - "${AUTH_PORT}"
+
+  project-service:
+    build: ./services/project-service
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PROJECT_PORT: ${PROJECT_PORT}
+      DATABASE_URL: ${PROJECT_DATABASE_URL}
+      AUTH_SERVICE_URL: ${AUTH_SERVICE_URL}
+    depends_on:
+      project-postgres:
+        condition: service_healthy
+    expose:
+      - "${PROJECT_PORT}"
+
+  task-service:
+    build: ./services/task-service
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      TASK_PORT: ${TASK_PORT}
+      MONGO_URL: ${MONGO_URL}
+      RABBITMQ_URL: ${RABBITMQ_URL}
+      RABBITMQ_EXCHANGE: ${RABBITMQ_EXCHANGE}
+      PROJECT_SERVICE_URL: ${PROJECT_SERVICE_URL}
+    depends_on:
+      mongo:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      project-service:
+        condition: service_started
+    expose:
+      - "${TASK_PORT}"
+
+  notification-service:
+    build: ./services/notification-service
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      NOTIFICATION_PORT: ${NOTIFICATION_PORT}
+      RABBITMQ_URL: ${RABBITMQ_URL}
+      RABBITMQ_EXCHANGE: ${RABBITMQ_EXCHANGE}
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    expose:
+      - "${NOTIFICATION_PORT}"
+
+  gateway:
+    build: ./gateway
+    restart: unless-stopped
+    ports:
+      - "${GATEWAY_PORT}:${GATEWAY_PORT}"
+    environment:
+      NODE_ENV: production
+      GATEWAY_PORT: ${GATEWAY_PORT}
+      JWT_SECRET: ${JWT_SECRET}
+      AUTH_SERVICE_URL: ${AUTH_SERVICE_URL}
+      TASK_SERVICE_URL: ${TASK_SERVICE_URL}
+      PROJECT_SERVICE_URL: ${PROJECT_SERVICE_URL}
+    depends_on:
+      - auth-service
+      - task-service
+      - project-service
+
+volumes:
+  pgdata:
+  projectpgdata:
+  mongodata:
