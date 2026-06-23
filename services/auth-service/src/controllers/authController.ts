@@ -2,7 +2,9 @@ import { Request, Response } from "express";
 import bcrypt from "bcryptjs";
 import type { User } from "@prisma/client";
 import { prisma } from "../lib/prisma";
-import { signToken } from "../lib/jwt";
+import { signAccessToken } from "../lib/jwt";
+import { issueRefreshToken, rotateRefreshToken, revokeRefreshToken } from "../lib/refreshTokens";
+import { setRefreshCookie, clearRefreshCookie, REFRESH_COOKIE } from "../lib/cookies";
 import { Errors } from "../lib/AppError";
 import { sendSuccess } from "../lib/http";
 
@@ -10,6 +12,20 @@ import { sendSuccess } from "../lib/http";
 function publicUser(user: User) {
   const { password, ...rest } = user;
   return rest;
+}
+
+// Issue a token pair: the refresh token goes into an httpOnly cookie; only the
+// access token (+ user) is returned in the response body.
+async function respondWithSession(
+  res: Response,
+  user: User,
+  message: string,
+  statusCode = 200
+) {
+  const accessToken = signAccessToken(user);
+  const refreshToken = await issueRefreshToken(user.id);
+  setRefreshCookie(res, refreshToken);
+  return sendSuccess(res, { accessToken, user: publicUser(user) }, message, statusCode);
 }
 
 export async function register(req: Request, res: Response) {
@@ -25,12 +41,10 @@ export async function register(req: Request, res: Response) {
     data: { email, password: hash, name },
   });
 
-  const token = signToken(user);
-  return sendSuccess(res, { token, user: publicUser(user) }, "registered", 201);
+  return respondWithSession(res, user, "registered", 201);
 }
 
 export async function login(req: Request, res: Response) {
-  // req.body is already validated by validateBody(loginSchema).
   const { email, password } = req.body;
 
   const user = await prisma.user.findUnique({ where: { email } });
@@ -43,8 +57,37 @@ export async function login(req: Request, res: Response) {
     throw Errors.unauthorized("invalid credentials");
   }
 
-  const token = signToken(user);
-  return sendSuccess(res, { token, user: publicUser(user) }, "logged in");
+  return respondWithSession(res, user, "logged in");
+}
+
+// Exchange the refresh-token cookie for a new access token; rotates the cookie
+// (old token revoked, a fresh one set). The frontend only ever sees the access
+// token in the body.
+export async function refresh(req: Request, res: Response) {
+  const token = req.cookies?.[REFRESH_COOKIE];
+  if (!token) {
+    throw Errors.unauthorized("missing refresh token");
+  }
+
+  const rotated = await rotateRefreshToken(token);
+  const user = await prisma.user.findUnique({ where: { id: rotated.userId } });
+  if (!user) {
+    throw Errors.unauthorized("invalid or expired refresh token");
+  }
+
+  const accessToken = signAccessToken(user);
+  setRefreshCookie(res, rotated.token);
+  return sendSuccess(res, { accessToken }, "token refreshed");
+}
+
+// Revoke the refresh-token cookie (logout) and clear it. Idempotent.
+export async function logout(req: Request, res: Response) {
+  const token = req.cookies?.[REFRESH_COOKIE];
+  if (token) {
+    await revokeRefreshToken(token);
+  }
+  clearRefreshCookie(res);
+  return sendSuccess(res, null, "logged out");
 }
 
 // Reads x-user-id forwarded by the gateway after it verified the JWT.

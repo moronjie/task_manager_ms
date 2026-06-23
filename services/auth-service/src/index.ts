@@ -1,5 +1,6 @@
 import express, { Request, Response } from "express";
 import cors from "cors";
+import cookieParser from "cookie-parser";
 import routes from "./routes";
 import { config } from "./config";
 import { errorHandler, notFoundHandler } from "./lib/http";
@@ -7,6 +8,7 @@ import { errorHandler, notFoundHandler } from "./lib/http";
 const app = express();
 app.use(cors());
 app.use(express.json());
+app.use(cookieParser());
 
 app.get("/health", (_req: Request, res: Response) =>
   res.json({ success: true, message: "ok", data: { service: "auth" } })
